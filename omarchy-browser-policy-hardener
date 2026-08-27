@@ -1,0 +1,446 @@
+#!/bin/bash
+
+# Temporary hardening for basecamp/omarchy issue #5547.
+# Supported write-patch target: Omarchy 4.0.1-1.
+
+set -euo pipefail
+
+VERSION=1.0.0
+SUPPORTED_OMARCHY_VERSION=4.0.1-1
+SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+TEST_ROOT=${OMARCHY_HARDENER_TEST_ROOT:-}
+STATE_DIR=/var/lib/omarchy-browser-policy-hardener
+INSTALL_PATH=/usr/local/libexec/omarchy-browser-policy-hardener
+SHARE_DIR=/usr/local/share/omarchy-browser-policy-hardener
+HOOK_PATH=/etc/pacman.d/hooks/95-omarchy-browser-policy-hardener.hook
+
+CHROMIUM_DIRS=(
+  /etc/chromium/policies/managed
+  /etc/opt/chrome/policies/managed
+  /etc/opt/edge/policies/managed
+  /etc/brave/policies/managed
+)
+
+DISTRIBUTION_DIRS=(
+  /usr/lib/firefox/distribution
+  /opt/zen-browser/distribution
+)
+
+root_path() {
+  printf '%s%s' "$TEST_ROOT" "$1"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  omarchy-browser-policy-hardener --audit
+  sudo ./omarchy-browser-policy-hardener --install
+  sudo omarchy-browser-policy-hardener --repair
+  sudo omarchy-browser-policy-hardener --uninstall
+
+Options:
+  --audit      Inspect supported browser policy paths without changing them.
+  --install    Back up, install the mitigation, repair policies, and add hook.
+  --repair     Recheck permissions and safely repair existing policy paths.
+  --uninstall  Restore backed-up Omarchy scripts and remove installed tooling.
+  --version    Print version.
+EOF
+}
+
+log() {
+  printf '[omarchy-policy] %s\n' "$*"
+}
+
+warn() {
+  printf '[omarchy-policy] WARNING: %s\n' "$*" >&2
+}
+
+die() {
+  printf '[omarchy-policy] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_root() {
+  if [[ -n $TEST_ROOT ]]; then
+    [[ ${OMARCHY_HARDENER_TESTING:-} == 1 ]] || die "TEST_ROOT requires OMARCHY_HARDENER_TESTING=1"
+  else
+    (( EUID == 0 )) || die "This operation must run as root"
+  fi
+}
+
+payload_dir() {
+  if [[ -f $SELF_DIR/files/omarchy-theme-browser-policy ]]; then
+    printf '%s/files' "$SELF_DIR"
+  else
+    printf '%s/files' "$(root_path "$SHARE_DIR")"
+  fi
+}
+
+omarchy_version() {
+  if [[ -n $TEST_ROOT ]]; then
+    printf '%s' "${OMARCHY_HARDENER_TEST_VERSION:-$SUPPORTED_OMARCHY_VERSION}"
+  elif command -v omarchy-version >/dev/null 2>&1; then
+    omarchy-version 2>/dev/null
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Q omarchy 2>/dev/null | awk '{print $2}'
+  fi
+}
+
+mode_is_safe() {
+  local mode=$1
+  (( (8#$mode & 022) == 0 ))
+}
+
+safe_admin_file() {
+  local path=$1 mode
+  [[ -f $path && ! -L $path ]] || return 1
+  [[ $(stat -c '%u' -- "$path") == 0 ]] || return 1
+  mode=$(stat -c '%a' -- "$path")
+  mode_is_safe "$mode"
+}
+
+safe_admin_entry() {
+  local path=$1 mode
+  [[ ! -L $path && ( -f $path || -d $path ) ]] || return 1
+  [[ $(stat -c '%u' -- "$path") == 0 ]] || return 1
+  mode=$(stat -c '%a' -- "$path")
+  mode_is_safe "$mode"
+}
+
+audit_path() {
+  local logical=$1 path entry metadata rc=0
+  path=$(root_path "$logical")
+
+  [[ -e $path || -L $path ]] || return 0
+  stat -c '%A %a %U:%G %F %n' -- "$path"
+
+  if [[ -L $path || ! -d $path ]]; then
+    warn "Refused path: $logical is not a real directory"
+    return 2
+  fi
+
+  metadata=$(stat -c '%u:%g:%a' -- "$path")
+  if [[ $metadata != 0:0:755 ]]; then
+    warn "Vulnerable directory permissions: $logical ($metadata, expected 0:0:755)"
+    rc=1
+  fi
+
+  find "$path" -mindepth 1 -maxdepth 1 -printf '%M %m %u:%g %y %p -> %l\n'
+
+  shopt -s dotglob nullglob
+  for entry in "$path"/*; do
+    if [[ $logical == */distribution ]]; then
+      safe_admin_entry "$entry" || {
+        warn "Unsafe distribution entry: ${entry#"$TEST_ROOT"}"
+        rc=1
+      }
+    elif [[ $entry == "$path/color.json" ]]; then
+      if [[ -L $entry || $(stat -c '%u:%g:%a' -- "$entry" 2>/dev/null || true) != 0:0:644 ]]; then
+        warn "Unsafe theme policy: ${entry#"$TEST_ROOT"}"
+        rc=1
+      fi
+    elif ! safe_admin_file "$entry"; then
+      warn "Unsafe managed policy: ${entry#"$TEST_ROOT"}"
+      rc=1
+    fi
+  done
+  shopt -u dotglob nullglob
+  return "$rc"
+}
+
+audit_all() {
+  local path rc=0
+  log "Omarchy version: $(omarchy_version || true)"
+  for path in "${CHROMIUM_DIRS[@]}" "${DISTRIBUTION_DIRS[@]}"; do
+    audit_path "$path" || rc=1
+  done
+  return "$rc"
+}
+
+backup_existing_path() {
+  local backup=$1 logical=$2 source label
+  source=$(root_path "$logical")
+  [[ -e $source || -L $source ]] || return 0
+  label=${logical#/}
+  label=${label//\//__}
+  cp -a -- "$source" "$backup/$label"
+}
+
+create_policy_backup() {
+  local timestamp backup logical
+  timestamp=$(date -u +%Y%m%dT%H%M%S)-$$
+  backup=$(root_path "$STATE_DIR/backups/$timestamp")
+  install -d -m 0700 -o root -g root "$backup"
+  for logical in "${CHROMIUM_DIRS[@]}" "${DISTRIBUTION_DIRS[@]}"; do
+    backup_existing_path "$backup" "$logical"
+  done
+  log "Policy backup: ${backup#"$TEST_ROOT"}"
+}
+
+backup_original_once() {
+  local logical=$1 source destination absent_marker
+  source=$(root_path "$logical")
+  destination=$(root_path "$STATE_DIR/originals$logical")
+  absent_marker=$destination.absent
+  [[ -e $destination || -L $destination || -e $absent_marker ]] && return 0
+  install -d -m 0700 -o root -g root "$(dirname -- "$destination")"
+  if [[ -e $source || -L $source ]]; then
+    cp -a -- "$source" "$destination"
+  else
+    : >"$absent_marker"
+    chmod 0600 "$absent_marker"
+  fi
+}
+
+current_theme_color() {
+  local logical policy color user_name user_home theme rgb r g b
+  user_name=${SUDO_USER:-${USER:-root}}
+  if [[ -n $TEST_ROOT ]]; then
+    user_home=$TEST_ROOT/home/tester
+  else
+    user_home=$(getent passwd "$user_name" | cut -d: -f6)
+  fi
+  theme=$user_home/.local/state/omarchy/current/theme/chromium.theme
+
+  if [[ -f $theme ]]; then
+    rgb=$(<"$theme")
+    IFS=, read -r r g b <<<"$rgb"
+    if [[ $r =~ ^[0-9]+$ && $g =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]] &&
+      (( r <= 255 && g <= 255 && b <= 255 )); then
+      printf '#%02x%02x%02x' "$r" "$g" "$b"
+      return
+    fi
+  fi
+
+  # A pacman hook has no desktop-user environment. Preserve an existing color
+  # when it is a plain file and contains exactly a valid hexadecimal value.
+  for logical in "${CHROMIUM_DIRS[@]}"; do
+    policy=$(root_path "$logical/color.json")
+    [[ -f $policy && ! -L $policy ]] || continue
+    color=$(sed -nE 's/.*"BrowserThemeColor"[[:space:]]*:[[:space:]]*"(#[0-9A-Fa-f]{6})".*/\1/p' "$policy" | head -n 1)
+    if [[ $color =~ ^#[0-9A-Fa-f]{6}$ ]]; then
+      printf '%s' "$color"
+      return
+    fi
+  done
+  printf '#1c2027'
+}
+
+repair_chromium_dir() {
+  local logical=$1 color=$2 path entry tmp
+  path=$(root_path "$logical")
+  [[ -e $path || -L $path ]] || return 0
+
+  if [[ -L $path || ! -d $path ]]; then
+    warn "Skipping unsafe policy path: $logical"
+    return 2
+  fi
+
+  install -d -m 0755 -o root -g root "$path"
+  shopt -s dotglob nullglob
+  for entry in "$path"/*; do
+    if [[ $entry != "$path/color.json" ]] && safe_admin_file "$entry"; then
+      continue
+    fi
+    log "Removing unsafe policy entry: ${entry#"$TEST_ROOT"}"
+    rm -rf -- "$entry"
+  done
+  shopt -u dotglob nullglob
+
+  tmp=$(mktemp "$path/.color.json.XXXXXX")
+  printf '{"BrowserThemeColor": "%s", "BrowserColorScheme": "device"}\n' "$color" >"$tmp"
+  chown root:root "$tmp"
+  chmod 0644 "$tmp"
+  mv -fT -- "$tmp" "$path/color.json"
+}
+
+repair_distribution_dir() {
+  local logical=$1 path entry policy source
+  path=$(root_path "$logical")
+  [[ -e $path || -L $path ]] || return 0
+
+  if [[ -L $path || ! -d $path ]]; then
+    warn "Skipping unsafe distribution path: $logical"
+    return 2
+  fi
+
+  install -d -m 0755 -o root -g root "$path"
+  shopt -s dotglob nullglob
+  for entry in "$path"/*; do
+    safe_admin_entry "$entry" && continue
+    log "Removing unsafe distribution entry: ${entry#"$TEST_ROOT"}"
+    rm -rf -- "$entry"
+  done
+  shopt -u dotglob nullglob
+
+  policy=$path/policies.json
+  if [[ -d $policy && ! -L $policy ]]; then
+    log "Removing invalid policy directory: ${policy#"$TEST_ROOT"}"
+    rm -rf -- "$policy"
+  fi
+
+  source=$(root_path /usr/share/omarchy/default/firefox/policies.json)
+  if ! safe_admin_file "$policy"; then
+    if safe_admin_file "$source"; then
+      install -m 0644 -o root -g root -T "$source" "$policy"
+    else
+      warn "Cannot safely restore $logical/policies.json: trusted Omarchy source is unavailable"
+    fi
+  fi
+}
+
+install_payload() {
+  local payload version
+  payload=$(payload_dir)
+  version=$(omarchy_version || true)
+  [[ $version == "$SUPPORTED_OMARCHY_VERSION" ]] ||
+    die "Write patch supports Omarchy $SUPPORTED_OMARCHY_VERSION; found ${version:-unknown}. Audit only."
+
+  for file in omarchy-theme-browser-policy omarchy-theme-set-browser omarchy-install-browser sudoers; do
+    [[ -f $payload/$file ]] || die "Missing payload: $payload/$file"
+  done
+
+  backup_original_once /usr/bin/omarchy-theme-browser-policy
+  backup_original_once /usr/bin/omarchy-theme-set-browser
+  backup_original_once /usr/bin/omarchy-install-browser
+  backup_original_once /etc/sudoers.d/omarchy-theme-browser-policy
+
+  install -D -o root -g root -m 0755 "$payload/omarchy-theme-browser-policy" \
+    "$(root_path /usr/bin/omarchy-theme-browser-policy)"
+  install -D -o root -g root -m 0755 "$payload/omarchy-theme-set-browser" \
+    "$(root_path /usr/bin/omarchy-theme-set-browser)"
+  install -D -o root -g root -m 0755 "$payload/omarchy-install-browser" \
+    "$(root_path /usr/bin/omarchy-install-browser)"
+  install -D -o root -g root -m 0440 "$payload/sudoers" \
+    "$(root_path /etc/sudoers.d/omarchy-theme-browser-policy)"
+
+  if [[ -z $TEST_ROOT ]]; then
+    visudo -cf /etc/sudoers >/dev/null
+  fi
+}
+
+install_self_and_hook() {
+  local payload file target
+  payload=$(payload_dir)
+  install -D -o root -g root -m 0755 "$SELF_DIR/$(basename -- "${BASH_SOURCE[0]}")" \
+    "$(root_path "$INSTALL_PATH")"
+  for file in "$payload"/*; do
+    target=$(root_path "$SHARE_DIR/files/$(basename -- "$file")")
+    install -D -o root -g root -m 0644 "$file" "$target"
+  done
+  chmod 0755 "$(root_path "$SHARE_DIR/files/omarchy-theme-browser-policy")" \
+    "$(root_path "$SHARE_DIR/files/omarchy-theme-set-browser")" \
+    "$(root_path "$SHARE_DIR/files/omarchy-install-browser")"
+
+  install -d -m 0755 -o root -g root "$(dirname -- "$(root_path "$HOOK_PATH")")"
+  cat >"$(root_path "$HOOK_PATH")" <<'EOF'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = omarchy
+Target = chromium
+Target = brave-bin
+Target = brave-origin-bin
+Target = google-chrome
+Target = microsoft-edge-stable-bin
+Target = firefox
+Target = zen-browser-bin
+
+[Action]
+Description = Recheck Omarchy browser managed-policy permissions
+When = PostTransaction
+Exec = /usr/local/libexec/omarchy-browser-policy-hardener --repair
+EOF
+  chown root:root "$(root_path "$HOOK_PATH")"
+  chmod 0644 "$(root_path "$HOOK_PATH")"
+}
+
+repair_all() {
+  local color logical rc=0
+  color=$(current_theme_color)
+  for logical in "${CHROMIUM_DIRS[@]}"; do
+    repair_chromium_dir "$logical" "$color" || rc=1
+  done
+  for logical in "${DISTRIBUTION_DIRS[@]}"; do
+    repair_distribution_dir "$logical" || rc=1
+  done
+  return "$rc"
+}
+
+install_all() {
+  require_root
+  create_policy_backup
+  install_payload
+  install_self_and_hook
+  repair_all
+  log "Installed mitigation $VERSION"
+}
+
+repair_after_update() {
+  local version
+  require_root
+  version=$(omarchy_version || true)
+  create_policy_backup
+  if [[ $version == "$SUPPORTED_OMARCHY_VERSION" ]]; then
+    install_payload
+  else
+    warn "Omarchy changed to ${version:-unknown}; not overwriting its scripts with a $SUPPORTED_OMARCHY_VERSION patch"
+  fi
+  repair_all
+}
+
+restore_original() {
+  local logical=$1 original absent_marker target
+  original=$(root_path "$STATE_DIR/originals$logical")
+  absent_marker=$original.absent
+  target=$(root_path "$logical")
+  if [[ -e $original || -L $original ]]; then
+    install -d -m 0755 -o root -g root "$(dirname -- "$target")"
+    rm -f -- "$target"
+    cp -a -- "$original" "$target"
+  elif [[ -e $absent_marker ]]; then
+    rm -f -- "$target"
+  else
+    warn "No original-state record for $logical; leaving it unchanged"
+  fi
+}
+
+uninstall_all() {
+  require_root
+  restore_original /usr/bin/omarchy-theme-browser-policy
+  restore_original /usr/bin/omarchy-theme-set-browser
+  restore_original /usr/bin/omarchy-install-browser
+  restore_original /etc/sudoers.d/omarchy-theme-browser-policy
+  rm -f -- "$(root_path "$HOOK_PATH")" "$(root_path "$INSTALL_PATH")"
+  rm -rf -- "$(root_path "$SHARE_DIR")"
+  if [[ -z $TEST_ROOT ]]; then
+    visudo -cf /etc/sudoers >/dev/null
+  fi
+  log "Removed tooling; hardened policy permissions were intentionally retained"
+}
+
+case ${1:---audit} in
+--audit)
+  audit_all
+  ;;
+--install)
+  install_all
+  ;;
+--repair)
+  repair_after_update
+  ;;
+--uninstall)
+  uninstall_all
+  ;;
+--version)
+  printf '%s\n' "$VERSION"
+  ;;
+-h | --help)
+  usage
+  ;;
+*)
+  usage >&2
+  exit 2
+  ;;
+esac

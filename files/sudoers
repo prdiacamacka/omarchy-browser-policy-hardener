@@ -1,0 +1,2 @@
+# Allow only the root-owned, argument-validating theme writer without a password.
+%wheel ALL=(root) NOPASSWD: /usr/bin/omarchy-theme-browser-policy *
