@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Based on basecamp/omarchy PR #8276, commit a1d35e7.
+# Upstream copyright and MIT terms: THIRD_PARTY_NOTICES.md in this project.
 # Writes only a validated theme color into fixed managed-policy files.
 
 set -euo pipefail

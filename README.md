@@ -2,6 +2,14 @@
 
 Temporary mitigation for [basecamp/omarchy issue #5547](https://github.com/basecamp/omarchy/issues/5547): older Omarchy installations create managed browser-policy directories with mode `0777`. A local process can then plant mandatory policies such as forced extensions, proxies, or disabled security controls.
 
+> [!IMPORTANT]
+> This is an independent, unofficial community project. It is not affiliated
+> with, maintained by, sponsored by, or endorsed by the Omarchy project,
+> Basecamp, 37signals, or Omacom. Omarchy is named only to identify the affected
+> system and compatibility. For official Omarchy information, use
+> [omarchy.org](https://omarchy.org/) and
+> [basecamp/omarchy](https://github.com/basecamp/omarchy).
+
 This project packages the constrained writer proposed in [PR #8276](https://github.com/basecamp/omarchy/pull/8276) and adds:
 
 - read-only audit mode;
@@ -107,6 +115,13 @@ Uninstall restores the scripts saved during first installation and removes the h
 ## Attribution
 
 The constrained writer and patched Omarchy browser scripts are based on Basecamp Omarchy PR #8276, commit `a1d35e73c01ee7fb27df6f9b52616d04f511ec81`, under Omarchy's MIT license.
+
+The upstream copyright and license notice retained for those derived portions
+is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Potential vulnerabilities in Omarchy itself should be reported privately using
+[Omarchy's security process](https://omarchy.org/security/), not published here
+before the upstream team has had an opportunity to investigate and fix them.
 
 ## License
 
