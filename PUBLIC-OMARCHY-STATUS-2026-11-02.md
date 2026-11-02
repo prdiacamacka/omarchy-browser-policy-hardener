@@ -51,7 +51,6 @@ is not part of the public status record.
 ## Commit privacy
 
 - GitHub commit email privacy is enabled for future commits.
-- Future commits use the GitHub `noreply` address:
-  `225977006+prdiacamacka@users.noreply.github.com`.
+- Future commits use GitHub's private `noreply` commit identity.
 - The historical personal commit email remains in prior Git metadata and is not
   repeated in this document.
